@@ -125,26 +125,50 @@ void us_loop_run(struct us_loop_t *loop) {
         loop->num_ready_polls = kevent(loop->fd, NULL, 0, loop->ready_polls, 1024, NULL);
 #endif
 
-        /* Iterate ready polls, dispatching them by type */
-        for (loop->current_ready_poll = 0; loop->current_ready_poll < loop->num_ready_polls; loop->current_ready_poll++) {
-            struct us_poll_t *poll = GET_READY_POLL(loop, loop->current_ready_poll);
-            /* Any ready poll marked with nullptr will be ignored */
-            if (poll) {
+        /* Prioritize wakeups only when the atomic latch says one is pending. */
+        const int prioritize_wakeup = atomic_load_explicit(
+            &loop->data.wake_pending, memory_order_acquire);
+        int wakeup_dispatched = 0;
+        const int passes = prioritize_wakeup ? 2 : 1;
+        for (int pass = 0; pass < passes; ++pass) {
+            const int wakeup_first = prioritize_wakeup && pass == 0;
+            for (int index = 0; index < loop->num_ready_polls; ++index) {
+                struct us_poll_t *poll = GET_READY_POLL(loop, index);
+                if (!poll) continue;
+                const int is_loop_wakeup = poll == (struct us_poll_t *) loop->data.wakeup_async;
+                const int dispatched_poll_type = !is_loop_wakeup && loop->data.wake_blocker_profiling
+                    ? us_internal_poll_type(poll) : -1;
+                if (wakeup_first ? !is_loop_wakeup : (is_loop_wakeup && wakeup_dispatched)) continue;
+                loop->current_ready_poll = wakeup_first ? 0 : index;
 #ifdef LIBUS_USE_EPOLL
-                int events = loop->ready_polls[loop->current_ready_poll].events;
-                int error = loop->ready_polls[loop->current_ready_poll].events & (EPOLLERR | EPOLLHUP);
+                int events = loop->ready_polls[index].events;
+                int error = loop->ready_polls[index].events & (EPOLLERR | EPOLLHUP);
 #else
                 /* EVFILT_READ, EVFILT_TIME, EVFILT_USER are all mapped to LIBUS_SOCKET_READABLE */
                 int events = LIBUS_SOCKET_READABLE;
-                if (loop->ready_polls[loop->current_ready_poll].filter == EVFILT_WRITE) {
+                if (loop->ready_polls[index].filter == EVFILT_WRITE) {
                     events = LIBUS_SOCKET_WRITABLE;
                 }
-                int error = loop->ready_polls[loop->current_ready_poll].flags & (EV_ERROR | EV_EOF);
+                int error = loop->ready_polls[index].flags & (EV_ERROR | EV_EOF);
 #endif
                 /* Always filter all polls by what they actually poll for (callback polls always poll for readable) */
                 events &= us_poll_events(poll);
                 if (events || error) {
+                    if (is_loop_wakeup) {
+                        loop->data.wake_blocker_type = -1;
+                        atomic_store_explicit(&loop->data.wake_pending, 0, memory_order_release);
+                    }
                     us_internal_dispatch_ready_poll(poll, error, events);
+                    if (is_loop_wakeup) wakeup_dispatched = 1;
+                    if (!is_loop_wakeup && !wakeup_dispatched &&
+                        atomic_load_explicit(&loop->data.wake_pending, memory_order_acquire) &&
+                        atomic_exchange_explicit(&loop->data.wake_pending, 0, memory_order_acq_rel)) {
+                        loop->current_ready_poll = index + 1;
+                        loop->data.wake_blocker_type = dispatched_poll_type;
+                        us_internal_dispatch_ready_poll(
+                            (struct us_poll_t *) loop->data.wakeup_async, 0, LIBUS_SOCKET_READABLE);
+                        wakeup_dispatched = 1;
+                    }
                 }
             }
         }
@@ -287,10 +311,17 @@ unsigned int us_internal_accept_poll_event(struct us_poll_t *p) {
 /* Timer */
 #ifdef LIBUS_USE_EPOLL
 struct us_timer_t *us_create_timer(struct us_loop_t *loop, int fallthrough, unsigned int ext_size) {
-    struct us_poll_t *p = us_create_poll(loop, fallthrough, sizeof(struct us_internal_callback_t) + ext_size);
     int timerfd = timerfd_create(CLOCK_REALTIME, TFD_NONBLOCK | TFD_CLOEXEC);
     if (timerfd == -1) {
       return NULL;
+    }
+    struct us_poll_t *p = us_create_poll(loop, fallthrough, sizeof(struct us_internal_callback_t) + ext_size);
+    if (!p) {
+        if (!fallthrough) {
+            loop->num_polls--;
+        }
+        close(timerfd);
+        return NULL;
     }
     us_poll_init(p, timerfd, POLL_TYPE_CALLBACK);
 
@@ -304,6 +335,9 @@ struct us_timer_t *us_create_timer(struct us_loop_t *loop, int fallthrough, unsi
 #else
 struct us_timer_t *us_create_timer(struct us_loop_t *loop, int fallthrough, unsigned int ext_size) {
     struct us_internal_callback_t *cb = malloc(sizeof(struct us_internal_callback_t) + ext_size);
+    if (!cb) {
+        return NULL;
+    }
 
     cb->loop = loop;
     cb->cb_expects_the_loop = 0;
@@ -352,6 +386,10 @@ void us_timer_close(struct us_timer_t *timer) {
     struct kevent event;
     EV_SET(&event, (uintptr_t) internal_cb, EVFILT_TIMER, EV_DELETE, 0, 0, internal_cb);
     kevent(internal_cb->loop->fd, &event, 1, NULL, 0, NULL);
+
+    /* Another callback may close a timer already present in this ready batch. */
+    us_internal_loop_update_pending_ready_polls(internal_cb->loop,
+        (struct us_poll_t *) timer, NULL, 0, 0);
 
     /* (regular) sockets are the only polls which are not freed immediately */
     us_poll_free((struct us_poll_t *) timer, internal_cb->loop);

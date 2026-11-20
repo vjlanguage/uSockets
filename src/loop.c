@@ -36,6 +36,9 @@ void us_internal_loop_data_init(struct us_loop_t *loop, void (*wakeup_cb)(struct
     loop->data.pre_cb = pre_cb;
     loop->data.post_cb = post_cb;
     loop->data.iteration_nr = 0;
+    atomic_init(&loop->data.wake_pending, 0);
+    loop->data.wake_blocker_type = -1;
+    loop->data.wake_blocker_profiling = 0;
 
     loop->data.wakeup_async = us_internal_create_async(loop, 1, 0);
     us_internal_async_set(loop->data.wakeup_async, (void (*)(struct us_internal_async *)) wakeup_cb);
@@ -53,7 +56,17 @@ void us_internal_loop_data_free(struct us_loop_t *loop) {
 }
 
 void us_wakeup_loop(struct us_loop_t *loop) {
+    atomic_store_explicit(&loop->data.wake_pending, 1, memory_order_release);
     us_internal_async_wakeup(loop->data.wakeup_async);
+}
+
+int us_loop_wake_blocker_type(struct us_loop_t *loop) {
+    return loop->data.wake_blocker_type;
+}
+
+void us_loop_set_wake_blocker_profiling(struct us_loop_t *loop, int enabled) {
+    loop->data.wake_blocker_profiling = enabled;
+    if (!enabled) loop->data.wake_blocker_type = -1;
 }
 
 void us_internal_loop_link(struct us_loop_t *loop, struct us_socket_context_t *context) {

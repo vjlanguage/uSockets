@@ -241,6 +241,10 @@ void us_loop_run(struct us_loop_t *loop);
 /* Signals the loop from any thread to wake up and execute its wakeup handler from the loop's own running thread.
  * This is the only fully thread-safe function and serves as the basis for thread safety */
 void us_wakeup_loop(struct us_loop_t *loop);
+/* Returns -1 for a wake not delayed by another ready poll, otherwise the
+ * internal poll type (socket=0, shutdown=1, semi-socket=2, callback=3). */
+int us_loop_wake_blocker_type(struct us_loop_t *loop);
+void us_loop_set_wake_blocker_profiling(struct us_loop_t *loop, int enabled);
 
 /* Hook up timers in existing loop */
 void us_loop_integrate(struct us_loop_t *loop);
