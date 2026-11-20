@@ -17,6 +17,7 @@
 
 #ifndef LOOP_DATA_H
 #define LOOP_DATA_H
+#include <stdatomic.h>
 
 struct us_internal_loop_data_t {
     struct us_timer_t *sweep_timer;
@@ -33,6 +34,10 @@ struct us_internal_loop_data_t {
     int low_prio_budget;
     /* We do not care if this flips or not, it doesn't matter */
     long long iteration_nr;
+    atomic_int wake_pending;
+    /* Owner-thread poll type that delayed the last inline wake dispatch. */
+    int wake_blocker_type;
+    int wake_blocker_profiling;
 };
 
 #endif // LOOP_DATA_H
